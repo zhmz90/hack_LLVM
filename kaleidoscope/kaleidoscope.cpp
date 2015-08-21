@@ -237,7 +237,60 @@ static int GetTokPrecedence()
 
 int main()
 {
-    Bio
+    BinoPrecedence['<'] = 10;
+    BinoPrecedence['+'] = 20;
+    BinoPrecedence['-'] = 20;
+    BinoPrecedence['*'] = 40;
 
+}
+
+static std::unique_ptr<ExprAST> ParseExpression()
+{
+    auto LHS = ParsePrimary();
+    if (!LHS)
+        return nullptr;
+
+    return ParseBinOpRHS(0, std::move(LHS));
+}
+
+static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec, std::unique_ptr<ExprAST> LHS)
+{
+    while (1)
+    {
+        int TokPrec = GetTokPrecedence();
+
+        if (TokPrec < ExprPrec)
+            return LHS;
+    }
+}
+
+int BinOp = CurTok();
+getNextToken();
+
+auto RHS = ParsePrimary();
+if (!RHS)
+    return nullptr;
+
+
+static std::unqiue_ptr<PrototypeAST> ParseProtype()
+{
+    if (CurTok != tok_identifier)
+        return ErrorP("Expected function name in prototype");
+
+    std::string FnName = IdentifierStr;
+    getNextToken();
+
+    if (CurTok != '(')
+        return ErrorP("Expected '(' in prototype");
+
+    std::vector<std::string> ArgNames;
+    while (getNextToken() == tok_identifier)
+        ArgNames.push_back(identifierStr);
+    if (CurTok != ')')
+        return ErrorP("Expected ')' in prototype");
+    
+    getNextToken();
+
+    return llvm::make_unqiue<PrototypeAST>(FnName, std::move(Arguments));
 }
 
