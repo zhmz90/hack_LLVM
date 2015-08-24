@@ -19,18 +19,19 @@
 #include <string>
 #include <vector>
 
+using namespace llvm;
 
 // Lexer
 //#######################
 enum Token
 {
-    tok_eof = -1;
+    tok_eof = -1,
 
-    tok_def = -2;
-    tok_extern = -3;
+    tok_def = -2,
+    tok_extern = -3,
 
-    tok_identifier = -4;
-    tok_number = -5;
+    tok_identifier = -4,
+    tok_number = -5
 
 };
 
@@ -48,7 +49,7 @@ static int gettok()
     if (isalpha(LastChar))
     {
         IdentifierStr = LastChar;
-        while (isalnum((LastChar = getChar())))
+        while (isalnum((LastChar = getchar())))
             IdentifierStr += LastChar;
 
         if (IdentifierStr == "def")
@@ -64,7 +65,7 @@ static int gettok()
         std::string NumStr;
         do {
             NumStr += LastChar;
-            LastChar = getChar();
+            LastChar = getchar();
         } while (isdigit(LastChar) || LastChar == '.');
     
         NumVal = strtod(NumStr.c_str(), 0);
@@ -119,7 +120,7 @@ class BinaryExprAST : public ExprAST{
 
 public:
     BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS, std::unique_ptr<ExprAST> RHS)
-        : Op(Op), LHS(std::move(LHS), RHS(std::move(RHS))){}
+        : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)){}
     Value *Codegen() override;
 };
 
@@ -151,10 +152,10 @@ class FunctionAST {
 public:
     FunctionAST(std::unique_ptr<PrototypeAST> Proto,
                 std::unique_ptr<ExprAST> Body)
-        : Proto(std::move(Proto), Body(std::move(Body)))
+        : Proto(std::move(Proto)), Body(std::move(Body)) {}
     Function *Codegen();
 };
-
+} // end anonymous namespace
 // Parser
 // a simple  token buffer
 static int CurTok;
@@ -167,7 +168,7 @@ static int GetTokPrecedence()
     if (!isascii(CurTok))
         return -1;
     
-    int TokPrec = BinoPrecedence[CurTok];
+    int TokPrec = BinopPrecedence[CurTok];
     if (TokPrec <= 0)
         return -1;
     return TokPrec;
@@ -256,7 +257,7 @@ static std::unique_ptr<ExprAST> ParsePrimary()
         case tok_number:
             return ParseNumberExpr();
         case '(':
-            return ParseParentExpr();
+            return ParseParenExpr();
     }
 
 }
@@ -279,19 +280,19 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
         if (!RHS)
            return nullptr;
 
-        if NextPrec =  GetTokPrecedence();        
+        int NextPrec =  GetTokPrecedence();        
         if (TokPrec < NextPrec)
         {
             RHS = ParseBinOpRHS(TokPrec+1,std::move(RHS));
             if(!RHS)
                 return nullptr;
         }
-        LHS = llvm::make_unique_ptr<BinaryExprAST>(BinOp, std::move(LHS), std::move(RHS));
+        LHS = llvm::make_unique<BinaryExprAST>(BinOp, std::move(LHS), std::move(RHS));
     }
 
 }
 
-static std::unqiue_ptr<ExprAST> ParseExpression() 
+static std::unique_ptr<ExprAST> ParseExpression() 
 {
     auto LHS = ParsePrimary();
     if (!LHS)
@@ -311,8 +312,8 @@ static std::unique_ptr<PrototypeAST> ParsePrototype()
     if (CurTok != '(')
         return ErrorP("Expected '(' in prototype");
     
-    std::vector<std::sting> ArgNames;
-    while (getNextToken() == tok_identifer)
+    std::vector<std::string> ArgNames;
+    while (getNextToken() == tok_identifier)
         ArgNames.push_back(IdentifierStr);
     if (CurTok != ')')
         return ErrorP("Expected ')' in prototype");
@@ -342,7 +343,7 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr()
     return nullptr;
 }
 
-static std::unique_ptr<PrototypAST> ParseExtern()
+static std::unique_ptr<PrototypeAST> ParseExtern()
 {
     getNextToken();
     return ParsePrototype();
@@ -381,7 +382,7 @@ std::string MakeLegalFunctionName(std::string Name)
         char old_c = NewName.at(pos);
         char new_str[16];
         sprintf(new_str, "%d", (int)old_c);
-        NewName = NewName.replace(pos, 1, new_str)
+        NewName = NewName.replace(pos, 1, new_str);
     }
     return NewName;
 }
@@ -391,32 +392,194 @@ std::string MakeLegalFunctionName(std::string Name)
 // ====================
 class MCJITHelper {
 public:
-    MCJITHelper(LLVMContext &C) : Context(C), Open
+    MCJITHelper(LLVMContext &C) : Context(C), OpenModule(NULL) {}
+    ~MCJITHelper();
+    
+    Function *getFunction(const std::string FnName);
+    Module *getModuleForNewFunction();
+    void *getPointerToFunction(Function *F);
+    void *getSymbolAddress(const std::string &Name);
+    void dump();
+private:
+    typedef std::vector<Module *> ModuleVector;
+    typedef std::vector<ExecutionEngine *> EngineVector;
 
+    LLVMContext &Context;
+    Module *OpenModule;
+    ModuleVector Modules;
+    EngineVector Engines;
+};
 
+class HelpingMemoryManager : public SectionMemoryManager {
+    HelpingMemoryManager(const HelpingMemoryManager &) = delete;
+    void operator=(const HelpingMemoryManager &) = delete;
+public:
+    HelpingMemoryManager(MCJITHelper *Helper) : MasterHelper(Helper) {}
+    ~HelpingMemoryManager() override {}
 
+    uint64_t getSymbolAddress(const std::string &Name) override;
+private:
+    MCJITHelper *MasterHelper;
+};
+
+uint64_t HelpingMemoryManager::getSymbolAddress(const std::string &Name)
+{
+    uint64_t FnAddr = SectionMemoryManager::getSymbolAddress(Name);
+    if (FnAddr)
+        return FnAddr;
+    
+    uint64_t HelperFun = (uint64_t)MasterHelper->getSymbolAddress(Name);
+    if (!HelperFun)
+        report_fatal_error("Program used extern function '" + Name + "' which could not be resolved!");
+
+    return HelperFun;
 }
 
+MCJITHelper::~MCJITHelper()
+{
+    if (OpenModule)
+        delete OpenModule;
+    EngineVector::iterator begin = Engines.begin();
+    EngineVector::iterator end = Engines.end();
+    EngineVector::iterator it;
+    for (it = begin; it != end; it++)
+        delete *it;
+}
 
+Function *MCJITHelper::getFunction(const std::string FnName){
+    ModuleVector::iterator begin = Modules.begin();
+    ModuleVector::iterator end = Modules.end();
+    ModuleVector::iterator it;
+    for (it = begin; it != end; it++)
+    {
+        Function *F = (*it)->getFunction(FnName);
+        if (F){
+            if (*it == OpenModule)
+                return F;
+            
+            assert(OpenModule != NULL);
+
+            Function *PF = OpenModule->getFunction(FnName);
+            if (PF && !PF->empty()){
+                ErrorF("redefinition of function across modules");
+                return nullptr;
+            }
+
+            if (!PF)
+                PF = Function::Create(F->getFunctionType(), Function::ExternalLinkage,
+                                        FnName, OpenModule);
+            return PF;
+        }
+    }
+    return NULL;
+}
+
+Module *MCJITHelper::getModuleForNewFunction(){
+    if (OpenModule)
+        return OpenModule;
+
+    std::string ModName = GenerateUniqueName("mcjit_module_");
+    Module *M = new Module(ModName, Context);
+    Modules.push_back(M);
+    OpenModule = M;
+    return M;
+}
+
+void *MCJITHelper::getPointerToFunction(Function *F)
+{
+    EngineVector::iterator begin = Engines.begin();
+    EngineVector::iterator end = Engines.end();
+    EngineVector::iterator it;
+    for (it = begin; it != end; it++)
+    {
+        void *P =  (*it)->getPointerToFunction(F);
+        if (P)
+            return P;
+    }
+    
+    if (OpenModule)
+    {
+        std::string ErrStr;
+        ExecutionEngine *NewEngine =
+            EngineBuilder(std::unique_ptr<Module>(OpenModule))
+                .setErrorStr(&ErrStr)
+                .setMCJITMemoryManager(std::unique_ptr<HelpingMemoryManager>(
+                            new HelpingMemoryManager(this)))
+                .create();
+        if (!NewEngine){
+            fprintf(stderr, "Could not create ExecutionEngine: %s\n", ErrStr.c_str());
+            exit(1);
+        }
+
+        auto *FPM = new legacy::FunctionPassManager(OpenModule);
+        
+        OpenModule->setDataLayout(NewEngine->getDataLayout());
+
+        FPM->add(createBasicAliasAnalysisPass());
+        FPM->add(createPromoteMemoryToRegisterPass());
+        FPM->add(createInstructionCombiningPass());
+        FPM->add(createReassociatePass());
+        FPM->add(createGVNPass());
+        FPM->doInitialization();
+
+        Module::iterator it;
+        Module::iterator end = OpenModule->end();
+        for (it = OpenModule->begin(); it != end; it++)
+            FPM->run(*it);
+
+        delete FPM;
+
+        OpenModule = NULL;
+        Engines.push_back(NewEngine);
+        NewEngine->finalizeObject();
+        return NewEngine->getPointerToFunction(F);
+    }
+    return NULL;
+}
+
+void *MCJITHelper::getSymbolAddress(const std::string &Name)
+{
+    EngineVector::iterator begin = Engines.begin();
+    EngineVector::iterator end = Engines.end();
+    EngineVector::iterator it;
+    for (it = begin; it != end; it++){
+        uint64_t FAddr = (*it)->getFunctionAddress(Name);
+        if (FAddr)
+            return (void *)FAddr;
+    }
+    return NULL;
+}
+
+void MCJITHelper::dump()
+{
+    ModuleVector::iterator begin = Modules.begin();
+    ModuleVector::iterator end = Modules.end();
+    ModuleVector::iterator it;
+    for (it = begin; it != end; it++)
+        (*it)->dump();
+}
 
 //======================================================
 // Code Generation
 //=====================================================
+
+static MCJITHelper *JITHelper;
+static IRBuilder<> Builder(getGlobalContext());
+static std::map<std::string, Value *> NamedValues;
+static Module *TheModule;
+
 Value *ErrorV(const char *Str)
 {
     Error(Str);
     return nullptr;
 }
-static Module *TheModule;
-static IRBuilder<> Builder(getGlobalContext());
-static std::map<std::string, Value *> NamedValues;
 
 Value *NumberExprAST::Codegen()
 {
     return ConstantFP::get(getGlobalContext(), APFloat(Val));
 }
 
-Value *VariableExprAST()::Codegen()
+Value *VariableExprAST::Codegen()
 {
     Value *V = NamedValues[Name];
     if (!V)
@@ -468,21 +631,23 @@ Function *PrototypeAST::Codegen()
     std::vector<Type *> Doubles(Args.size(), Type::getDoubleTy(getGlobalContext()));
     
     FunctionType *FT = 
-        FunctionType::get(Type::getDoubleTy(getGlobalContext()), Doubles, false)
+        FunctionType::get(Type::getDoubleTy(getGlobalContext()), Doubles, false);
+    std::string FnName = MakeLegalFunctionName(Name);
+    Module *M = JITHelper->getModuleForNewFunction();
     Function *F =
         Function::Create(FT, Function::ExternalLinkage, Name, TheModule);
     
-    if (F->getName() != Name){
+    if (F->getName() != FnName){
         F->eraseFromParent();
-        F = TheModule->getFunction(Name);
+        F = JITHelper->getFunction(Name);
 
         if (!F->empty()){
             ErrorF("redefinition of function");
             return nullptr;
         }
-
+        
         if (F->arg_size() != Args.size()){
-            ErrorF(redefinition of function with different # args);
+            ErrorF("redefinition of function with different # args");
             return nullptr;
         }
     }
@@ -521,7 +686,6 @@ Function *FunctionAST::Codegen() {
 //  Top-Level parsing and JIT Driver
 //
 
-    
 static void HandleDefinition()
 {
     if (auto FnAST = ParseDefinition())
@@ -553,11 +717,13 @@ static void HandleExtern()
 }
 static void HandleTopLevelExpression()
 {
-     if (auto FnAST = ParseTopLevelExpression())
+     if (auto FnAST = ParseTopLevelExpr())
     {
-        if (auot *FnAST = FnAST->Codegen() ){
-            fprintf(stderr,"Read a top-level expr: ");
-            FnIR->dump();
+        if (auto *FnIR = FnAST->Codegen() ){
+            void *FPtr = JITHelper->getPointerToFunction(FnIR);
+
+            double (*FP)() = (double (*)())(intptr_t)FPtr;
+            fprintf(stderr,"Evalated to %f\n", FP());
         }
     }
     else
@@ -566,7 +732,6 @@ static void HandleTopLevelExpression()
     }
    
 }
-
 
 static void MainLoop()
 {
@@ -577,14 +742,14 @@ static void MainLoop()
         {
             case tok_eof:
                 return;
-            case ";":
+            case ';':
                 getNextToken();
                 break;
             case tok_def:
                 HandleDefinition();
                 break;
             case tok_extern:
-                HandleExern();
+                HandleExtern();
                 break;
             default:
                 HandleTopLevelExpression();
@@ -594,25 +759,36 @@ static void MainLoop()
 
 }
 
+extern "C" double putchard(double X){
+    putchar((char)X);
+    return 0;
+}
+
+extern "C" double printd(double X){
+    printf("%f\n", X);
+    return 0;
+}
+
 int main()
 {
-    LLVMContext &context = getGlobalContext();
+    InitializeNativeTarget();
+    InitializeNativeTargetAsmPrinter();
+    InitializeNativeTargetAsmParser();
 
-    BinoPrecedence['<'] = 10;
-    BinoPrecedence['+'] = 20;
-    BinoPrecedence['-'] = 20;
-    BinoPrecedence['*'] = 40;
+    LLVMContext &Context = getGlobalContext();
+    JITHelper = new MCJITHelper(Context);
+
+    BinopPrecedence['<'] = 10;
+    BinopPrecedence['+'] = 20;
+    BinopPrecedence['-'] = 20;
+    BinopPrecedence['*'] = 40;
 
     fprintf(stderr, "ready>");
     getNextToken();
 
-    std::unique_ptr<Module> Owner = 
-        llvm::make_unique<Module>("my cool jit", Context);
-    TheModule = Owner.get();
-
     MainLoop();
 
-    TheModule->dump();
+    JITHelper->dump();
 
     return 0;
 }
