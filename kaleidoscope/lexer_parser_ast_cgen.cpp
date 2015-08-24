@@ -1,4 +1,18 @@
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Analysis/BasicAliasAnalysis.h"
+#include "llvm/Analysis/Passes.h"
+#include "llvm/ExecutionEngine/ExecutionEngine.h"
+#include "llvm/ExecutionEngine/MCJIT.h"
+#include "llvm/ExecutionEngine/SectionMemoryManager.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Transforms/Scalar.h"
 #include <cctype>
 #include <cstdio>
 #include <map>
@@ -6,6 +20,8 @@
 #include <vector>
 
 
+// Lexer
+//#######################
 enum Token
 {
     tok_eof = -1;
@@ -18,14 +34,16 @@ enum Token
 
 };
 
-static std::string IdentifierStr;
-static double NumVal;
+static std::string IdentifierStr; // tok_identifier
+static double NumVal;   // tok_number
 
-static int getTok()
+
+// return the next token from STDIN
+static int gettok()
 {
     static int LastChar = ' ';
     while (isspace(LastChar))
-        LastChar = getChar();
+        LastChar = getchar();
 
     if (isalpha(LastChar))
     {
@@ -77,20 +95,22 @@ namespace {
 class ExprAST {
 public:
     virtual ~ExprAST() {}
-}    
-};
+    virtual Value *Codegen() = 0;
+};    
 
 class NumberExprAST : public ExprAST{
     double Val;
+
 public:
     NumberExprAST(double Val): Val(Val){}
+    Value *Codegen() override;
 };
 
 class VariableExprAST : public ExprAST {
     std::string Name;
 public:
     VariableExprAST(const std::string &Name): Name(Name){}
-
+    Value *Codegen() override;
 };
 
 class BinaryExprAST : public ExprAST{
@@ -100,6 +120,7 @@ class BinaryExprAST : public ExprAST{
 public:
     BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS, std::unique_ptr<ExprAST> RHS)
         : Op(Op), LHS(std::move(LHS), RHS(std::move(RHS))){}
+    Value *Codegen() override;
 };
 
 class CallExprAST : public ExprAST {
@@ -109,6 +130,7 @@ class CallExprAST : public ExprAST {
 public:
     CallExprAST(const std::string &Callee, std::vector<std::unique_ptr<ExprAST>> Args)
         : Callee(Callee), Args(std::move(Args)) {}
+    Value *Codegen() override;
 
 };
 
@@ -119,7 +141,7 @@ class PrototypeAST {
 public:
     PrototypeAST(const std::string &Name, std::vector<std::string> Args)
         : Name(Name), Args(std::move(Args)) {}
-
+    Function *Codegen();
 };
 
 class FunctionAST {
@@ -130,6 +152,7 @@ public:
     FunctionAST(std::unique_ptr<PrototypeAST> Proto,
                 std::unique_ptr<ExprAST> Body)
         : Proto(std::move(Proto), Body(std::move(Body)))
+    Function *Codegen();
 };
 
 // Parser
@@ -155,7 +178,12 @@ std::unique_ptr<ExprAST> Error(const char *Str){
     return nullptr;
 }
 
-std::unique_ptr<ExprAST> ErrorP(const char *Str){
+std::unique_ptr<PrototypeAST> ErrorP(const char *Str){
+    Error(Str);
+    return nullptr;
+}
+
+std::unique_ptr<FunctionAST> ErrorF(const char *Str){
     Error(Str);
     return nullptr;
 }
@@ -185,7 +213,7 @@ static std::unique_ptr<ExprAST> ParseParenExpr()
 
 static std::unique_ptr<ExprAST> ParseIdentifierExpr()
 {
-    std::string idName = IdentifierStr;
+    std::string IdName = IdentifierStr;
     
     getNextToken();
 
@@ -203,8 +231,10 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr()
                 Args.push_back(std::move(Arg));
             else
                 return nullptr;
+
             if (CurTok == ')')
                 break;
+
             if (CurTok != ',')
                 return Error("Expected ')' or ',' in argument list");
             getNextToken();
@@ -231,6 +261,7 @@ static std::unique_ptr<ExprAST> ParsePrimary()
 
 }
 
+// binoprhs
 static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec, 
                                 std::unique_ptr<ExprAST> LHS)
 {
@@ -258,6 +289,15 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
         LHS = llvm::make_unique_ptr<BinaryExprAST>(BinOp, std::move(LHS), std::move(RHS));
     }
 
+}
+
+static std::unqiue_ptr<ExprAST> ParseExpression() 
+{
+    auto LHS = ParsePrimary();
+    if (!LHS)
+        return nullptr;
+    
+    return ParseBinOpRHS(0, std::move(LHS));
 }
 
 static std::unique_ptr<PrototypeAST> ParsePrototype()
@@ -288,7 +328,18 @@ static std::unique_ptr<FunctionAST> ParseDefinition()
     if (!Proto)
         return nullptr;
     if (auto E = ParseExpression())
-        return llvm::make_unique<FunctionAST>(std::move(Proto, std::move(E)));
+        return llvm::make_unique<FunctionAST>(std::move(Proto), std::move(E));
+    return nullptr;
+}
+
+static std::unique_ptr<FunctionAST> ParseTopLevelExpr()
+{
+    if (auto E = ParseExpression()){
+        auto Proto =
+            llvm::make_unique<PrototypeAST>("",std::vector<std::string>());
+        return llvm::make_unique<FunctionAST>(std::move(Proto),std::move(E));
+    }
+    return nullptr;
 }
 
 static std::unique_ptr<PrototypAST> ParseExtern()
@@ -297,13 +348,188 @@ static std::unique_ptr<PrototypAST> ParseExtern()
     return ParsePrototype();
 }
 
-// Top-Level Parsing
+//=========================
+// Quick and dirty hack
+//=========================
+std::string GenerateUniqueName(const char *root)
+{
+    static int i=0;
+    char s[16];
+    sprintf(s, "%s%d", root, i++);
+    std::string S=s;
+    return S;
+}
 
+std::string MakeLegalFunctionName(std::string Name)
+{
+    std::string NewName;
+    if (!Name.length())
+        return GenerateUniqueName("auto_func_");
+
+    NewName = Name;
+
+    if (NewName.find_first_of("0123456789") == 0)
+    {
+        NewName.insert(0, 1, 'n');
+    }
+
+    std::string legal_elements = 
+        "_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    size_t pos;
+    while ((pos = NewName.find_first_not_of(legal_elements)) !=
+            std::string::npos){
+        char old_c = NewName.at(pos);
+        char new_str[16];
+        sprintf(new_str, "%d", (int)old_c);
+        NewName = NewName.replace(pos, 1, new_str)
+    }
+    return NewName;
+}
+
+//=====================
+// MCJIT helper class
+// ====================
+class MCJITHelper {
+public:
+    MCJITHelper(LLVMContext &C) : Context(C), Open
+
+
+
+}
+
+
+
+//======================================================
+// Code Generation
+//=====================================================
+Value *ErrorV(const char *Str)
+{
+    Error(Str);
+    return nullptr;
+}
+static Module *TheModule;
+static IRBuilder<> Builder(getGlobalContext());
+static std::map<std::string, Value *> NamedValues;
+
+Value *NumberExprAST::Codegen()
+{
+    return ConstantFP::get(getGlobalContext(), APFloat(Val));
+}
+
+Value *VariableExprAST()::Codegen()
+{
+    Value *V = NamedValues[Name];
+    if (!V)
+        return ErrorV("Unkown variable name");
+    return V;
+}
+
+Value *BinaryExprAST::Codegen() 
+{
+    Value *L = LHS->Codegen();
+    Value *R = RHS->Codegen();
+    if (!L||!R)
+        return nullptr;
+    switch (Op){
+    case '+':
+        return Builder.CreateFAdd(L, R, "addtmp");
+    case '-':
+        return Builder.CreateFSub(L, R, "subtmp");
+    case '*':
+        return Builder.CreateFMul(L, R, "multmp");
+    case '<':
+        L = Builder.CreateFCmpULT(L, R, "cmptmp");
+        return Builder.CreateUIToFP(L, Type::getDoubleTy(getGlobalContext()),
+                                    "booltmp");
+    default:
+        return ErrorV("invalid binary operator");
+    }
+}
+
+Value *CallExprAST::Codegen() {
+    Function *CalleeF = TheModule->getFunction(Callee);
+    if (!CalleeF)
+        return ErrorV("unkown function referenced");
+    
+    if (CalleeF->arg_size() != Args.size())
+        return ErrorV("Incorrect # argmuments passed");
+
+    std::vector<Value *> ArgsV;
+    for (unsigned i=0, e = Args.size(); i != e; i++ ){
+        ArgsV.push_back(Args[i]->Codegen());
+        if (!ArgsV.back())
+            return nullptr;
+    }
+    return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
+}
+
+Function *PrototypeAST::Codegen()
+{
+    std::vector<Type *> Doubles(Args.size(), Type::getDoubleTy(getGlobalContext()));
+    
+    FunctionType *FT = 
+        FunctionType::get(Type::getDoubleTy(getGlobalContext()), Doubles, false)
+    Function *F =
+        Function::Create(FT, Function::ExternalLinkage, Name, TheModule);
+    
+    if (F->getName() != Name){
+        F->eraseFromParent();
+        F = TheModule->getFunction(Name);
+
+        if (!F->empty()){
+            ErrorF("redefinition of function");
+            return nullptr;
+        }
+
+        if (F->arg_size() != Args.size()){
+            ErrorF(redefinition of function with different # args);
+            return nullptr;
+        }
+    }
+    
+    unsigned Idx = 0;
+    for (Function::arg_iterator AI = F->arg_begin(); Idx != Args.size(); AI++, Idx++)
+    {
+        AI->setName(Args[Idx]);
+        NamedValues[Args[Idx]] = AI;
+    }
+
+    return F;
+}
+
+Function *FunctionAST::Codegen() {
+    NamedValues.clear();
+    
+    Function *TheFunction = Proto->Codegen();
+    if (!TheFunction)
+        return nullptr;
+
+    BasicBlock *BB = BasicBlock::Create(getGlobalContext(), "entry", TheFunction);
+    Builder.SetInsertPoint(BB);
+
+    if (Value *RetVal = Body->Codegen()){
+        Builder.CreateRet(RetVal);
+        verifyFunction(*TheFunction);
+        return TheFunction;
+    }
+
+    TheFunction->eraseFromParent();
+    return nullptr;
+}
+
+//
+//  Top-Level parsing and JIT Driver
+//
+
+    
 static void HandleDefinition()
 {
-    if (ParseDefinition())
+    if (auto FnAST = ParseDefinition())
     {
-        fprintf(stderr, "Parsed a function definition.\n");
+        if (auto *FnIR = FnAST->Codegen()){
+            fprintf(stderr, "Parsed a function definition.\n");
+            FnIR->dump();
+        }
     }
     else
     {
@@ -312,9 +538,12 @@ static void HandleDefinition()
 }
 static void HandleExtern()
 {
-    if (ParseExtern())
+    if (auto ProtoAST = ParseExtern())
     {
-        fprintf(stderr,"Parsed a extern\n");
+        if (auto *FnIR = ProtoAST->Codegen()){
+            fprintf(stderr,"Read extern: ");
+            FnIR->dump();
+        }
     }
     else
     {
@@ -324,9 +553,12 @@ static void HandleExtern()
 }
 static void HandleTopLevelExpression()
 {
-     if (ParseTopLevelExpression())
+     if (auto FnAST = ParseTopLevelExpression())
     {
-        fprintf(stderr,"Parsed a top-level expr\n");
+        if (auot *FnAST = FnAST->Codegen() ){
+            fprintf(stderr,"Read a top-level expr: ");
+            FnIR->dump();
+        }
     }
     else
     {
@@ -350,8 +582,10 @@ static void MainLoop()
                 break;
             case tok_def:
                 HandleDefinition();
+                break;
             case tok_extern:
                 HandleExern();
+                break;
             default:
                 HandleTopLevelExpression();
                 break;
@@ -362,14 +596,25 @@ static void MainLoop()
 
 int main()
 {
+    LLVMContext &context = getGlobalContext();
+
     BinoPrecedence['<'] = 10;
     BinoPrecedence['+'] = 20;
     BinoPrecedence['-'] = 20;
     BinoPrecedence['*'] = 40;
 
     fprintf(stderr, "ready>");
+    getNextToken();
+
+    std::unique_ptr<Module> Owner = 
+        llvm::make_unique<Module>("my cool jit", Context);
+    TheModule = Owner.get();
+
     MainLoop();
+
+    TheModule->dump();
 
     return 0;
 }
+
 
